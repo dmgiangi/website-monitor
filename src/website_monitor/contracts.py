@@ -1,3 +1,11 @@
+"""
+Core interfaces for the website monitoring system.
+
+This module defines the abstract base classes that form the foundation of the
+monitoring system's architecture. These interfaces establish a clear contract
+for implementations and enable a modular, pluggable design.
+"""
+
 import abc
 from typing import AsyncIterator, List
 
@@ -15,16 +23,40 @@ class WorkScheduler(abc.ABC):
 
     @abc.abstractmethod
     async def start(self) -> None:
-        """Prepares the scheduler to start yielding work."""
+        """
+        Prepares the scheduler to start yielding work.
+
+        This method should be called before using the scheduler in an async for loop.
+        It may establish connections, initialize resources, or perform other setup tasks.
+
+        Returns:
+            None
+        """
         pass
 
     @abc.abstractmethod
-    async def close(self) -> None:
-        """Gracefully stops the scheduler and releases any acquired resources."""
+    async def stop(self) -> None:
+        """
+        Gracefully stops the scheduler and releases any acquired resources.
+
+        This method should be called when the scheduler is no longer needed.
+        It should clean up any resources and ensure a graceful shutdown.
+
+        Returns:
+            None
+        """
         pass
 
     def __aiter__(self) -> AsyncIterator[List[Target]]:
-        """Allows the scheduler to be used in an 'async for' loop."""
+        """
+        Allows the scheduler to be used in an 'async for' loop.
+
+        This method implements the AsyncIterator protocol, making the scheduler
+        directly usable in async for loops.
+
+        Returns:
+            AsyncIterator[List[Target]]: The scheduler instance itself.
+        """
         return self
 
     @abc.abstractmethod
@@ -34,6 +66,12 @@ class WorkScheduler(abc.ABC):
 
         This method should block efficiently until work is available and should
         raise StopAsyncIteration when the scheduler is gracefully closed.
+
+        Returns:
+            List[Target]: A list of Target objects to be processed.
+
+        Raises:
+            StopAsyncIteration: When the scheduler has been stopped.
         """
         raise StopAsyncIteration
 
@@ -51,11 +89,19 @@ class TargetFetcher(abc.ABC):
         """
         Performs an HTTP check on the given target.
 
+        This method is responsible for making the actual HTTP request to the target,
+        measuring performance metrics, and packaging the results into a structured format.
+
         Args:
-            target: The Target object to check.
+            target: The Target object to check, containing URL, method, and other configuration.
 
         Returns:
-            A FetchResult object containing the outcome of the check.
+            FetchResult: An object containing the outcome of the check, including status code,
+                timing information, and any errors encountered.
+
+        Raises:
+            Exception: Implementations should handle network errors internally and include
+                them in the FetchResult rather than raising them.
         """
         pass
 
@@ -74,7 +120,15 @@ class ResultProcessor(abc.ABC):
         """
         Processes a single FetchResult object.
 
+        This method is called for each result produced by a TargetFetcher.
+        Implementations might store the result in a database, update metrics,
+        trigger alerts, or perform other actions based on the result.
+
         Args:
-            result: The result of a target fetch operation to be processed.
+            result: The result of a target fetch operation to be processed,
+                containing all information about the check outcome.
+
+        Returns:
+            None
         """
         pass

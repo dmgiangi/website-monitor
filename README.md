@@ -11,6 +11,7 @@
 - [Getting Started](#getting-started)
     - [Prerequisites](#prerequisites)
     - [Installation](#installation)
+  - [Configuration](#configuration)
 - [How to Run and Test](#how-to-run-and-test)
     - [Running the Application](#running-the-application)
     - [Running Tests](#running-tests)
@@ -90,6 +91,13 @@ graph TD
 
     subgraph "Result Processing Pipeline"
         I_Processor["<< Interface >>\nResultProcessor"]
+        DelegatingProcessor[DelegatingProcessor]
+        DelegatingProcessor -- implements --> I_Processor
+        Processor1[Processor1]
+        Processor2[Processor2]
+        DelegatingProcessor -- delegates --> Processor1
+        DelegatingProcessor -- delegates --> Processor2
+
     end
 
 %% Data Flow
@@ -185,7 +193,110 @@ significant external dependency and operational overhead. Given the project's sc
 separate sites ..." and the explicit constraint against external schedulers, this was deemed unnecessary complexity. The
 chosen database-centric model provides sufficient power without the extra infrastructure.
 
+## Getting Started
+
+This section provides instructions on how to set up the project locally.
+
+### Prerequisites
+
+To run this project, you need to have the following installed:
+
+- Python 3.10 or higher
+- PostgreSQL 12 or higher
+- Git (for cloning the repository)
+
+### Installation
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/dmgiangi/website-monitor.git
+   cd website-monitor
+   ```
+
+2. Install the project dependencies using pip:
+   ```bash
+   pip install .
+   ```
+
+   For development, install with dev dependencies:
+   ```bash
+   pip install ".[dev]"
+   ```
+
+3. Set up the PostgreSQL database:
+    - Create a new PostgreSQL database
+    - Initialize the database schema using the SQL scripts in the migrations folder:
+      ```bash
+      psql -U your_username -d your_database_name -f migrations/0001-create-initial-schema.sql
+      ```
+    - Optionally, populate the database with test data using the generate_insert_query.py script:
+      ```bash
+      python utils/generate_insert_query.py
+      psql -U your_username -d your_database_name -f utils/insert_query.sql
+      ```
+      This will generate a SQL file with 10 random monitored targets and insert them into the database.
+
+### Configuration
+
+The application supports the following configuration options, which can be set via command-line arguments or environment
+variables:
+
+| Parameter                  | Command-line Argument           | Environment Variable                  | Default Value                                                                            | Description                                                                              |
+|----------------------------|---------------------------------|---------------------------------------|------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
+| Database Connection String | `-dsn`                          | `WEBSITE_MONITOR_DSN`                 | `postgresql://postgres:password@localhost/test?options=-c+search_path%3Dwebsite_monitor` | Specifies the connection string for the PostgreSQL database                              |
+| Worker ID                  | `-wid`, `--worker-id`           | `WEBSITE_MONITOR_WORKER_ID`           | `website-monitor-{random-uuid}`                                                          | Specifies the worker ID for the monitoring service                                       |
+| Worker Number              | `-wn`, `--worker-number`        | `WEBSITE_MONITOR_WORKER_NUMBER`       | `50`                                                                                     | Specifies the maximum number of concurrent monitoring tasks                              |
+| DB Pool Size               | `-ps`, `--db-pool-size`         | `WEBSITE_MONITOR_DB_POOL_SIZE`        | `25`                                                                                     | Specifies the maximum number of connections in the database connection pool              |
+| Batch Size                 | `-bs`, `--batch-size`           | `WEBSITE_MONITOR_BATCH_SIZE`          | `15`                                                                                     | Specifies the batch size for processing website monitoring tasks                         |
+| Queue Size                 | `-qs`, `--queue-size`           | `WEBSITE_MONITOR_QUEUE_SIZE`          | `150`                                                                                    | Specifies the maximum number of items in the processing queue                            |
+| Max Timeout                | `-mt`, `--max-timeout`          | `WEBSITE_MONITOR_MAX_TIMEOUT`         | `3`                                                                                      | Specifies the maximum timeout duration in seconds for HTTP requests                      |
+| Raise For Status           | `-rfs`, `--raise-for-status`    | `WEBSITE_MONITOR_RAISE_FOR_STATUS`    | `true`                                                                                   | Specifies whether to raise an exception for non-successful HTTP status codes             |
+| Enable Tracing             | `-t`, `--enable-tracing`        | `WEBSITE_MONITOR_ENABLE_TRACING`      | `false`                                                                                  | Enables tracing for client sessions                                                      |
+| Logging Type               | `-lt`, `--logging-type`         | `WEBSITE_MONITOR_LOGGING_TYPE`        | `prod`                                                                                   | Specifies the logging configuration type to use. Allowed values: `dev`, `prod`, `custom` |
+| Logging Config File        | `-lcf`, `--logging-config-file` | `WEBSITE_MONITOR_LOGGING_CONFIG_FILE` | `""` (empty string)                                                                      | Path to custom logging configuration file. Required when logging-type is `custom`        |
+
+Example usage with command-line arguments:
+
+```bash
+python -m src --batch-size 40 --worker-number 100 --queue-size 300 --raise-for-status true --logging-type dev
+```
+
+Example environment variables in `.env` file:
+
+```
+WEBSITE_MONITOR_DSN=postgresql://user:password@localhost/mydb?options=-c+search_path%3Dwebsite_monitor
+WEBSITE_MONITOR_WORKER_ID=my-worker-1
+WEBSITE_MONITOR_WORKER_NUMBER=100
+WEBSITE_MONITOR_DB_POOL_SIZE=100
+WEBSITE_MONITOR_BATCH_SIZE=40
+WEBSITE_MONITOR_QUEUE_SIZE=300
+WEBSITE_MONITOR_RAISE_FOR_STATUS=true
+WEBSITE_MONITOR_ENABLE_TRACING=true
+WEBSITE_MONITOR_LOGGING_TYPE=dev
+WEBSITE_MONITOR_LOGGING_CONFIG_FILE=/path/to/custom/logging/config.json
+```
+
 ## Technical Debt
+
+### ✅ Implemented: Worker Now Supports Graceful Shutdown
+
+**Description**: The MonitoringWorker now includes a robust mechanism for graceful shutdown. This allows the worker to
+be stopped in a controlled manner, ensuring all in-flight operations complete before termination.
+
+**Implementation Details**:
+
+- **Awaitable stop() Method**: A public `async def stop()` method has been implemented that coordinates the shutdown
+  process.
+- **Complete Task Processing**: The shutdown sequence ensures all queued tasks are processed before termination.
+- **Resource Cleanup**: All background tasks are properly cancelled and awaited, preventing resource leaks.
+- **Orderly Shutdown Flow**:
+    1. Scheduler is stopped to prevent new job production
+    2. All pending tasks in the queue are allowed to complete
+    3. Background worker tasks and monitoring tasks are cancelled
+    4. System waits for all tasks to acknowledge cancellation and exit
+
+This implementation ensures data consistency and system stability during shutdown operations, making the application
+suitable for production environments.
 
 ### Issue: Synchronous Logging in an Asynchronous Application
 
@@ -201,23 +312,67 @@ halt all concurrent tasks (e.g., HTTP checks, database queries) and undermine th
 production quality code.
 
 **Proposed Solution**: To resolve this, the logging system should be moved to a non-blocking model. The recommended
-approach is to implement a
-queue-based logger:
-
-An async logger handler would be created to place formatted log messages into an asyncio.Queue. This is a rapid,
-in-memory operation that would not block the event loop.
-A separate, dedicated asyncio task would run in the background. Its sole responsibility would be to consume messages
-from the queue and perform the actual (potentially blocking) I/O of writing them to their final destination.
-This would fully decouple the logging I/O from the main application logic, ensuring that logging operations can never
-impact the performance or latency of the core monitoring tasks.
-
-### Issue: CI/CD prepare a pipeline to perform database migrations
-
-TODO
+approach is to implement a queue-based logger or use an appropriate dependency.
 
 ### Issue: Missing open-telemetry instrumentation
 
-TODO
+**Description**: The application currently lacks comprehensive, standardized observability. There is no integrated
+instrumentation to generate traces, metrics, and correlated logs, leaving a significant visibility gap into application
+performance and the lifecycle of user requests. The internal behavior of the service is effectively a "black box" in
+production.
+
+**Impact**:
+
+- **Reactive vs. Proactive Problem-Solving**
+- **Difficult and Slow Root Cause Analysis**
+- **Inability to Identify Performance Bottlenecks**
+- **Lack of Business-Critical SLOs**
+
+**Proposed Solution**: Add the OTel SDK to the application.
+
+### Issue: missing CI/CD pipeline
+
+**Description**: The current release process is a fragmented collection of manual or semi-automated steps. Key
+stages—running tests, applying database schema changes, and deploying the application—are not integrated into a single,
+automated workflow. This forces developers to perform these critical tasks in an ad-hoc manner, creating a process that
+is slow, unreliable, and prone to human error.
+
+**Impact**:
+
+- **High Deployment Failure Rate & Downtime**
+- **No Quality Assurance Gate**
+- **Slow Development Velocity**
+- **Inconsistent Environments**
+
+**Proposed Solution**: Implement a unified, automated CI/CD pipeline that enforces quality and makes releases a
+reliable, repeatable, and low-risk process. This pipeline will consist of distinct, automated stages.
+
+1. Continuous Integration (CI) Stage:
+
+    - _Trigger_: On every git push to a pull request.
+    - _Actions_: The pipeline will automatically build the application, run code linting and static analysis, and
+      execute the complete unit and integration test suite.
+    - _Gate_: Merging is blocked unless all tests and checks pass, ensuring the main branch is always stable.
+
+2. Staging Environment Deployment Stage:
+
+    - _Trigger_: On every successful merge to the main branch.
+    - _Actions_: Automated DB Migration: The pipeline connects to the staging database and automatically applies any
+      pending schema migrations.
+    - _Automated Application Deployment_: If migrations succeed, the new version of the application is deployed to the
+      staging environment.
+    - _Automated Smoke Tests_: A suite of end-to-end tests runs against the live staging environment to verify the
+      deployment's health.
+
+3. Production Environment Deployment Stage:
+
+    - _Trigger_: On manual approval (e.g., a "Promote to Production" button) or automatically if the staging deployment
+      is
+      successful.
+    - _Actions_: The pipeline will execute the exact same, tested sequence used for staging: first, run database
+      migrations
+      against the production database, and then deploy the application. Reusing the same automated process eliminates
+      surprises and drastically increases reliability.
 
 ## CONTACT
 

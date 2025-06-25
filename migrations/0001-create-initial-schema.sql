@@ -24,7 +24,7 @@ CREATE DOMAIN valid_regex AS TEXT
 CREATE TABLE monitored_targets
 (
     id              SERIAL PRIMARY KEY,
-    url             TEXT     NOT NULL CHECK (url ~* '^https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:\d+)?(/.*)?$'),
+    url TEXT NOT NULL CHECK (url ~* '^https?://[a-zA-Z0-9.-]+(:\d+)?(/.*)?$'),
     method          TEXT     NOT NULL CHECK (method ~* 'GET|POST|PUT|DELETE|PATCH'),
     check_interval  INTERVAL NOT NULL,
     default_headers JSONB,

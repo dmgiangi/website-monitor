@@ -2,3 +2,4 @@
 .venv
 .idea
 .junie
+utils/insert_query.sql
