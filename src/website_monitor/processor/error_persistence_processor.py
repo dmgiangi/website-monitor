@@ -2,15 +2,15 @@
 Database persistence module for monitoring check failures.
 
 This module provides functionality to persist information about failed monitoring
-checks to a database. It captures detailed information about the failure, including
-the error type, timing information, and a snapshot of the target configuration.
+checks to a database in efficient batches.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-from asyncpg import Pool
+from asyncpg import Pool, exceptions
 
 from website_monitor.contracts import ResultProcessor
 from website_monitor.domain import FetchResult
@@ -21,80 +21,89 @@ logger = logging.getLogger(__name__)
 
 class FailurePersistenceProcessor(ResultProcessor):
     """
-    A result processor that persists failure information to a database.
+    A result processor that persists failure information to a database in batches.
 
-    This processor is responsible for storing detailed information about failed
-    monitoring checks in the database. It only processes results that contain
-    an error and ignores successful checks.
-
-    Attributes:
-        _worker_id (str): The identifier of the worker that performed the check.
-        _pool (Pool): The database connection pool for database operations.
+    This processor buffers results that contain an error and writes them to the
+    database when the buffer is full or when the flush() method is called.
+    Successful checks are ignored.
     """
 
-    def __init__(self, worker_id: str, pool: Pool) -> None:
+    def __init__(self, worker_id: str, pool: Pool, max_buffer_size: int = 50) -> None:
         """
         Initialize a new FailurePersistenceProcessor.
 
         Args:
-            worker_id (str): The identifier of the worker that performed the check.
-            pool (Pool): The database connection pool for database operations.
+            worker_id: The identifier of the worker that performed the check.
+            pool: The database connection pool for database operations.
+            max_buffer_size: The max number of failures to buffer before flushing.
         """
         self._worker_id: str = worker_id
         self._pool: Pool = pool
+        self._max_buffer_size: int = max_buffer_size
+        self._buffer: List[FetchResult] = []
+        self._lock = asyncio.Lock()
+        self._insert_sql = """
+            INSERT INTO failure_log (original_target_id, worker_id, check_start_time,
+                                     check_end_time, failure_type, detail,
+                                     http_status_code, target_snapshot)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+        """
 
     async def process(self, result: FetchResult) -> None:
         """
-        Process a fetch result by persisting failure information to the database.
+        Process a fetch result by buffering failure information.
 
-        This method checks if the result contains an error. If it does, it extracts
-        relevant information and stores it in the failure_log table. If the result
-        does not contain an error (successful check), this method does nothing.
+        If the result contains an error, it's added to the buffer. If the buffer
+        reaches its maximum size, a flush is triggered. Successful checks are ignored.
 
         Args:
-            result (FetchResult): The result of a monitoring check to process.
-
-        Returns:
-            None
-
-        Raises:
-            No exceptions are raised from this method. Database errors are caught
-            and logged internally.
+            result: The result of a monitoring check to process.
         """
         if result.error is None:
             # The check was successful, do nothing.
             return
 
-        # Convert Unix timestamps to datetime objects with UTC timezone
-        check_start_time = datetime.fromtimestamp(result.start_time, tz=timezone.utc)
-        check_end_time = datetime.fromtimestamp(result.end_time, tz=timezone.utc)
+        async with self._lock:
+            self._buffer.append(result)
+            should_flush = len(self._buffer) >= self._max_buffer_size
 
-        # Extract error information
-        failure_type = type(result.error).__name__
-        detail = str(result.error)
+        if should_flush:
+            logger.info(f"Failure buffer limit of {self._max_buffer_size} reached. Flushing.")
+            await self.flush()
 
-        # Create a snapshot of the target configuration for historical reference
-        target_snapshot: Dict[str, Any] = {
-            "url": result.target.url,
-            "method": result.target.method.value,
-            "check_interval_seconds": result.target.check_interval.total_seconds(),
-            "regex_pattern": result.target.regex_pattern,
-            "default_headers": result.target.default_headers,
-        }
+    async def flush(self) -> None:
+        """
+        Persists all currently buffered failure logs to the database in a single batch.
+        """
+        async with self._lock:
+            if not self._buffer:
+                return
+            data_to_flush = list(self._buffer)
+            self._buffer.clear()
 
-        # SQL query to insert the failure record
-        query = """
-                INSERT INTO failure_log (original_target_id, worker_id, check_start_time,
-                                         check_end_time, failure_type, detail,
-                                         http_status_code, target_snapshot)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                """
+        logger.info(f"Flushing {len(data_to_flush)} failure logs to the database.")
 
-        try:
-            # Acquire a connection from the pool and execute the query
-            async with self._pool.acquire() as connection:
-                await connection.execute(
-                    query,
+        records_to_insert = []
+        for result in data_to_flush:
+            # This check is technically redundant if process() is the only way
+            # to add to the buffer, but it adds robustness.
+            if result.error is None:
+                continue
+
+            # Perform data transformations for each record
+            check_start_time = datetime.fromtimestamp(result.start_time, tz=timezone.utc)
+            check_end_time = datetime.fromtimestamp(result.end_time, tz=timezone.utc)
+            failure_type = type(result.error).__name__
+            detail = str(result.error)
+            target_snapshot: Dict[str, Any] = {
+                "url": result.target.url,
+                "method": result.target.method.value,
+                "check_interval_seconds": result.target.check_interval.total_seconds(),
+                "regex_pattern": result.target.regex_pattern,
+                "default_headers": result.target.default_headers,
+            }
+            records_to_insert.append(
+                (
                     result.target.id,
                     self._worker_id,
                     check_start_time,
@@ -104,14 +113,22 @@ class FailurePersistenceProcessor(ResultProcessor):
                     result.status_code,
                     target_snapshot,
                 )
-            logger.debug(
-                "Successfully persisted failure for original_target_id=%s: %s",
-                result.target.id,
-                failure_type,
+            )
+
+        if not records_to_insert:
+            return
+
+        try:
+            async with self._pool.acquire() as connection:
+                await connection.executemany(self._insert_sql, records_to_insert)
+            logger.debug(f"Successfully flushed {len(records_to_insert)} failure logs.")
+        except exceptions.PostgresError as e:
+            logger.exception(
+                f"Database error during batch flush of failure logs: {e}. "
+                f"{len(records_to_insert)} logs may be lost."
             )
         except Exception:
-            # Log the exception but don't propagate it to avoid disrupting the processing pipeline
             logger.exception(
-                "Failed to persist failure for original_target_id=%s to the database.",
-                result.target.id,
+                f"An unexpected error occurred during batch flush of failure logs. "
+                f"{len(records_to_insert)} logs may be lost."
             )

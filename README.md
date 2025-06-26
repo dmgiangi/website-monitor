@@ -5,7 +5,9 @@
 ## Table of Contents
 
 - [Introduction](#introduction)
+- [Main Feature](#main-feature)
 - [Software Architecture](#software-architecture)
+- [Documentation Index](#documentation-index)
 - [Dependencies Used](#dependencies-used)
 - [Compromises Taken](#compromises-taken)
 - [Getting Started](#getting-started)
@@ -16,34 +18,61 @@
     - [Running the Application](#running-the-application)
     - [Running Tests](#running-tests)
 - [Technical Debt](#technical-debt)
+- [Reference](#reference)
 - [Contact](#contact)
+
+## Documentation Index
+
+- [Dependencies and Choices](DEPENDENCIES.md)
+- [Architectural Compromises](COMPROMISES.md)
+- [How to Run and Test](RUN.md)
 
 ## Introduction
 
 This project is an implementation of a website monitoring service.\
 The program is designed to monitor the availability of many websites by performing periodic checks. For each check, it
-collects metrics such as the request timestamp, response time, and HTTP status code, and stores these results in a
-PostgresSQL database. It also includes an optional feature to validate page contents against a regular expression on a
-per-URL basis.
+collects metrics such as the request timestamp, response time, and HTTP status code, the match of a regex in the
+response body and stores these results in a PostgresSQL database. It also includes an optional feature to validate page
+contents against a regular expression on a per-URL basis.
+
+## Main Feature
+
+This service is engineered to be a reliable, high-performance monitoring solution. Its key features are designed to
+ensure scalability, fault tolerance, and maintainability.
+
+- **Comprehensive Health Checks**: Monitors website uptime, latency, HTTP status codes, and optionally validates page
+  content with regular expressions.
+- **High-Performance Asynchronous Core**: Built entirely on asyncio with non-blocking libraries (aiohttp, asyncpg) to
+  handle thousands of concurrent checks efficiently.
+- **Fault-Tolerant DB-Driven Scheduling**: Uses PostgreSQL to manage job state, ensuring no checks are lost during an
+  application restart.
+- **Efficient Low-Polling Operation**: Leverages PostgreSQL's native LISTEN/NOTIFY system to activate workers in
+  real-time, eliminating the need for constant, CPU-intensive database polling.
+- **Horizontally Scalable**: Designed to scale by allowing multiple worker instances to operate in parallel against the
+  same database safely, using FOR UPDATE SKIP LOCKED.
+- **Highly Configurable & Tunable**: Performance, including the number of workers, queue size, and batch size, can be
+  finely tuned via command-line arguments or environment variables.
+- **Graceful Shutdown**: Supports a controlled shutdown process that ensures all in-flight tasks are completed before
+  termination, guaranteeing data integrity.
 
 ## Software Architecture
 
 The primary design goal for this solution was maintainability, leading to a decoupled, protocol-driven architecture
 that is reliable, efficient, and testable.
 
-**Database-Driven Scheduling**: To meet the requirement of not using an external scheduling library, the system
-implements a
-robust scheduler directly within PostgresSQL. This is achieved using a lease table pattern, where the database itself
-manages the state of when each task is due. This approach provides excellent fault tolerance, as the scheduling state is
-durable and survives application restarts.
+**Efficient Concurrency with Adaptive Polling**: To ensure efficiency and horizontal scalability, the system relies on
+two core PostgreSQL features:
 
-**Efficient Concurrency**: To ensure efficiency and avoid wasteful, constant polling, the worker is event-driven. It
-leverages PostgresSQL's LISTEN/NOTIFY for task wakeup. Database-level transactional locks (FOR UPDATE SKIP LOCKED)
-manage concurrency and data integrity, ensuring reliable task processing even at scale.
+1. **Concurrent Task Acquisition**: Database-level transactional locks (FOR UPDATE SKIP LOCKED) are used to manage
+   concurrency. This allows multiple worker instances, even on different machines, to safely select and lease due tasks
+   without race conditions or processing the same target twice.
+2. **Adaptive Polling Scheduler**: To avoid wasteful, constant database queries, the worker implements a "smart" polling
+   mechanism. When no tasks are immediately available, the scheduler queries for the timestamp of the next due task. It
+   then calculates the precise duration to sleep, putting the worker into an idle, low-CPU state until work is expected
+   to be ready. This approach is highly efficient and minimizes unnecessary load on the database.
 
 **Decoupled Pipeline**: The application is structured as a pipeline of components, where each major function is governed
-by
-an abstract interface. This includes:
+by an abstract interface. This includes:
 
 - _WorkScheduler_ for acquiring tasks
 - _TargetFetcher_ for executing HTTP calls,
@@ -57,8 +86,7 @@ This solution adheres to all the **constraints** outlined in the project descrip
 
 _Language_: The application is written exclusively in Python.\
 _Database_: The system uses PostgresSQL and interacts with it using the asyncpg library for direct, raw SQL queries. No
-ORM
-libraries were used, as per the requirements.
+ORM libraries were used, as per the requirements.\
 _Concurrency & Scheduling_: All concurrency and scheduling are handled natively using Python's built-in asyncio library
 in
 combination with the database-driven logic described above. No external scheduling libraries were used.
@@ -70,6 +98,20 @@ sections below.
 graph TD
     subgraph "Persistence Layer"
         PostgresSQL[(PostgresSQL)]
+    end
+
+    subgraph "Result Processing Pipeline"
+        I_Processor["<< Interface >>\nResultProcessor"]
+        DelegatingProcessor[DelegatingProcessor]
+        DelegatingProcessor -- implements --> I_Processor
+        PrometheusProcessor["PrometheusProcessor\nimplements ResultProcessor"]
+        MetricsPersistenceProcessor["MetricsPersistenceProcessor\nimplements ResultProcessor"]
+        FailurePersistenceProcessor["FailurePersistenceProcessor\nimplements ResultProcessor"]
+        DelegatingProcessor -- delegates --> FailurePersistenceProcessor
+        DelegatingProcessor -- delegates --> MetricsPersistenceProcessor
+        DelegatingProcessor -- delegates --> PrometheusProcessor
+        FailurePersistenceProcessor -- updates --> PostgresSQL
+        MetricsPersistenceProcessor -- updates --> PostgresSQL
     end
 
     subgraph "Scheduling Components"
@@ -89,16 +131,7 @@ graph TD
         AiohttpFetcher -- implements --> I_Fetcher
     end
 
-    subgraph "Result Processing Pipeline"
-        I_Processor["<< Interface >>\nResultProcessor"]
-        DelegatingProcessor[DelegatingProcessor]
-        DelegatingProcessor -- implements --> I_Processor
-        Processor1[Processor1]
-        Processor2[Processor2]
-        DelegatingProcessor -- delegates --> Processor1
-        DelegatingProcessor -- delegates --> Processor2
 
-    end
 
 %% Data Flow
     I_Scheduler -- " Yields List<Target> " --> Orchestrator
@@ -116,8 +149,7 @@ graph TD
 **Description**: A high-performance, asynchronous database driver for PostgresSQL.
 
 **Motivation**: A hard constraint of the project is the prohibition of Database ORM libraries, requiring the use of a "
-Python DB API or
-similar library and raw SQL queries" instead.
+Python DB API or similar library and raw SQL queries" instead.
 Asyncpg meets these requirements perfectly. It is a non-ORM driver that allows for writing raw SQL, and its native
 integration with asyncio ensures that database operations are non-blocking and do not halt the concurrent execution of
 other tasks.
@@ -148,19 +180,18 @@ every log message, severely degrading the performance and responsiveness require
 
 #### CHOSEN: database-driven scheduler
 
-The selected model is a database-driven scheduler using a dedicated "lease table" in PostgresSQL. In this pattern, the
-application's worker process queries the database for tasks that are due, locks the corresponding rows to prevent race
-conditions, and then executes the work.
+The selected model is a database-driven scheduler using a dedicated "lease table" in PostgreSQL. This represents a
+deliberate compromise: **we are accepting a higher degree of interaction with the database in exchange for superior
+fault
+tolerance and data integrity**. By persisting the scheduling state (next_fire_at), the system can gracefully recover
+from
+restarts and guarantee that tasks are not lost or skipped, a key requirement for production-quality code.
 
-This represents a deliberate compromise: we are accepting a higher degree of interaction with the database in exchange
-for superior fault tolerance and data integrity. By persisting the scheduling state (next_fire_at), the system can
-gracefully recover from restarts and guarantee that tasks are not lost or skipped, a key requirement for production
-quality code.
-
-The potential inefficiency of database polling is mitigated by using PostgresSQL's LISTEN/NOTIFY system. This allows the
-worker to remain idle until work is likely available, thus meeting the efficiency requirement without constant, empty
-queries. This choice directly supports the main design goal of maintainability by leveraging the existing, reliable
-database infrastructure.
+The potential inefficiency of a naive polling loop is mitigated by an intelligent adaptive polling strategy. When no
+work is available, the scheduler calculates the exact time until the next task is due and puts itself into an
+asynchronous sleep for that precise duration. This approach minimizes unnecessary database load and CPU usage while
+maintaining timely execution, directly supporting the design goal of maintainability by leveraging the existing,
+reliable database infrastructure.
 
 #### Alternative Approaches Considered
 
@@ -213,7 +244,13 @@ To run this project, you need to have the following installed:
    cd website-monitor
    ```
 
-2. Install the project dependencies using pip:
+2. Create and activate a virtual environment:
+   ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+   ```
+
+3. Install the project dependencies using pip:
    ```bash
    pip install .
    ```
@@ -223,18 +260,13 @@ To run this project, you need to have the following installed:
    pip install ".[dev]"
    ```
 
-3. Set up the PostgreSQL database:
+4. Set up the PostgreSQL database:
     - Create a new PostgreSQL database
     - Initialize the database schema using the SQL scripts in the migrations folder:
       ```bash
       psql -U your_username -d your_database_name -f migrations/0001-create-initial-schema.sql
+      psql -U your_username -d your_database_name -f migrations/0002-create-monitoring-schema.sql
       ```
-    - Optionally, populate the database with test data using the generate_insert_query.py script:
-      ```bash
-      python utils/generate_insert_query.py
-      psql -U your_username -d your_database_name -f utils/insert_query.sql
-      ```
-      This will generate a SQL file with 10 random monitored targets and insert them into the database.
 
 ### Configuration
 
@@ -258,7 +290,7 @@ variables:
 Example usage with command-line arguments:
 
 ```bash
-python -m src --batch-size 40 --worker-number 100 --queue-size 300 --raise-for-status true --logging-type dev
+python -m src -dsn {your_dsn}
 ```
 
 Example environment variables in `.env` file:
@@ -275,6 +307,141 @@ WEBSITE_MONITOR_ENABLE_TRACING=true
 WEBSITE_MONITOR_LOGGING_TYPE=dev
 WEBSITE_MONITOR_LOGGING_CONFIG_FILE=/path/to/custom/logging/config.json
 ```
+
+## How to Run and Test
+
+This section provides instructions on how to run the application and execute tests.
+
+### Running the Application
+
+To run the website monitoring application:
+
+1. Ensure you have completed the installation and configuration steps in the [Getting Started](#getting-started)
+   section.
+
+2. Run the application using the Python module:
+   ```bash
+   python -m src.website_monitor
+   ```
+
+3. Alternatively, you can use environment variables or command-line arguments to customize the configuration:
+   ```bash
+   python -m src.website_monitor -dsn "your_connection_string"
+   ```
+
+   See the [Configuration](#configuration) section for all available options.
+
+4. The application will start monitoring websites according to the targets defined in your database.
+
+### Running Tests
+
+To run the test suite:
+
+1. Ensure you have installed the development dependencies:
+   ```bash
+   pip install ".[dev]"
+   ```
+
+2. Run the tests using pytest:
+   ```bash
+   pytest
+   ```
+
+   For more verbose output:
+   ```bash
+   pytest -v
+   ```
+
+   To run specific test files:
+   ```bash
+   pytest tests/test_worker.py
+   ```
+
+3. The test suite includes unit tests and integration tests that verify the functionality of all components.
+
+### Utility Modules
+
+The project includes utility modules in the `utils/` directory to help with testing and setup:
+
+#### Mock Server
+
+A simple HTTP mock server for testing website monitoring:
+
+- Simulates a website with varying response times (90% fast, 10% slow)
+- Responds to any path with a 200 OK status and random content
+- Useful for local testing and development
+
+To run the mock server:
+
+```bash
+python utils/mock_server.py
+```
+
+The server will start listening on `http://localhost:8080`.
+
+##### Testing with the Mock Server
+
+The mock server provides a controlled environment for testing the website monitoring application. Here's how to use it
+for testing:
+
+1. **Start the mock server** in a separate terminal window:
+   ```bash
+   python utils/mock_server.py
+   ```
+
+2. **Generate test data** that points to the mock server:
+   ```bash
+   python utils/generate_insert_query.py
+   ```
+   This creates `utils/insert_query.sql` with 2000 URLs pointing to the mock server with different paths.
+
+3. **Insert the test data** into your database:
+   ```bash
+   psql -U your_username -d your_database_name -f utils/insert_query.sql
+   ```
+
+4. **Run the website monitoring application** in another terminal:
+   ```bash
+   python -m src.website_monitor
+   ```
+
+5. **Observe the monitoring results**:
+    - The application will monitor the URLs pointing to the mock server
+    - You'll see a mix of fast responses (5-500ms) and slow responses (5-30s)
+    - This allows you to test how the application handles different response times
+    - The regex pattern tests will sometimes pass and sometimes fail (random content)
+
+This setup is particularly useful for:
+
+- Testing the application's handling of slow responses
+- Verifying timeout functionality
+- Testing concurrent request handling
+- Ensuring metrics are correctly recorded for various response scenarios
+- Testing the application's behavior with a high volume of targets (2000 by default)
+
+You can modify the constants in `utils/mock_server.py` and `utils/generate_insert_query.py` to adjust the behavior for
+specific testing scenarios.
+
+#### SQL Generator
+
+A utility script for generating test data:
+
+- Creates SQL insert queries for the monitored_targets table
+- Generates random URLs, check intervals, and regex patterns
+
+To generate test data:
+
+```bash
+python utils/generate_insert_query.py
+```
+
+Then load the generated SQL into your database:
+
+```bash
+psql -U your_username -d your_database_name -f utils/insert_query.sql
+```
+
+For more details about these utilities, see the [utils/README.md](utils/README.md) file.
 
 ## Technical Debt
 
@@ -373,6 +540,35 @@ reliable, repeatable, and low-risk process. This pipeline will consist of distin
       migrations
       against the production database, and then deploy the application. Reusing the same automated process eliminates
       surprises and drastically increases reliability.
+
+## REFERENCE
+
+This section lists the key resources and tools that were instrumental in the design, development, and documentation of
+this project.
+
+### Books and Literature
+
+- Ramalho, Luciano. **Fluent Python**: Clear, Concise, and Effective Programming. 2nd ed., O'Reilly Media, 2022.
+
+This book was the primary reference for designing the application's concurrency model. Its in-depth exploration of
+Python's asyncio library directly influenced the implementation of the producer-consumer pattern, the management of
+asynchronous tasks, and the overall approach to building a high-throughput, non-blocking service.
+
+### Development and Documentation Tools
+
+- **Google's Gemini 2.5 Pro Large Language Model**
+
+  The Gemini 2.5 Pro model was used extensively as a development assistant and a technical sounding board throughout the
+  project lifecycle. Its contributions were focused in the following areas:
+
+    - **Decision Discussion**: Aiding in the articulation and evaluation of architectural trade-offs, as detailed in
+      the "Compromises Taken" section.
+    - **Documentation Writing**: Accelerating the creation of structured, professional documentation, including the
+      generation of this README.md file, docstrings, and technical debt analysis.
+      .
+- **JetBrains' Junie AI assistant**
+    - **Test Writing**: Scaffolding unit tests and providing idiomatic patterns for mocking asynchronous dependencies
+      within the pytest and pytest-asyncio frameworks.
 
 ## CONTACT
 

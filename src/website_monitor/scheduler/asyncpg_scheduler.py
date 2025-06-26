@@ -79,7 +79,14 @@ class PostgresScheduler(WorkScheduler):
     is processed by only one worker at a time.
     """
 
-    def __init__(self, worker_id: str, pool: Pool, batch_size: int, recover_time: int = 10) -> None:
+    def __init__(
+        self,
+        worker_id: str,
+        pool: Pool,
+        batch_size: int,
+        recover_time: int = 10,
+        max_sleep_duration: int = 60,
+    ) -> None:
         """
         Initializes a new PostgresScheduler instance.
 
@@ -106,6 +113,7 @@ class PostgresScheduler(WorkScheduler):
         self._batch_size: int = batch_size
         self._recover_time: int = recover_time
         self._is_running: bool = False
+        self._max_sleep_duration: int = max_sleep_duration
 
     async def start(self) -> None:
         """
@@ -165,13 +173,12 @@ class PostgresScheduler(WorkScheduler):
                     next_deadline = await conn.fetchval(GET_NEXT_FIRE_AT_QUERY)
 
                 # Calculate how long to sleep until the next target is due
-                sleep_duration_seconds: float = 60  # Default to 60 seconds
                 if next_deadline:
                     now = datetime.now(timezone.utc)
                     sleep_duration_seconds = max(0, (next_deadline - now).total_seconds())
 
                 # Cap the sleep duration to 60 seconds to ensure we check periodically
-                sleep_duration_seconds = min(sleep_duration_seconds, 60)
+                sleep_duration_seconds = min(self._max_sleep_duration, 60)
 
                 logger.info(f"No tasks due. Sleeping for {sleep_duration_seconds:.2f} seconds.")
                 await asyncio.sleep(sleep_duration_seconds)

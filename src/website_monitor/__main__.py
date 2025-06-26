@@ -18,7 +18,7 @@ from website_monitor.config.http_config import get_http_session
 from website_monitor.config.logging_config import configure_logging
 from website_monitor.fetcher.aiohttp_fetcher import AiohttpFetcher
 from website_monitor.processor.delegating_processor import DelegatingResultProcessor
-from website_monitor.processor.error_persistence_processor import ErrorPersistenceProcessor
+from website_monitor.processor.error_persistence_processor import FailurePersistenceProcessor
 from website_monitor.processor.metrics_persistence_processor import MetricsPersistenceProcessor
 from website_monitor.processor.prometheus_processor import PrometheusProcessor
 from website_monitor.scheduler.asyncpg_scheduler import PostgresScheduler
@@ -63,15 +63,15 @@ async def main(context: MonitoringContext) -> None:
         queue_size=context.queue_size,
         scheduler=PostgresScheduler(worker_id=worker_id, pool=db_pool, batch_size=batch_size),
         fetcher=AiohttpFetcher(
-            worker_id=worker_id, 
-            session=http_session, 
+            worker_id=worker_id,
+            session=http_session,
             max_timeout=context.max_timeout,
-            raise_for_status=context.raise_for_status
+            raise_for_status=context.raise_for_status,
         ),
         processor=DelegatingResultProcessor(
             worker_id,
             [
-                ErrorPersistenceProcessor(worker_id=worker_id, pool=db_pool),
+                FailurePersistenceProcessor(worker_id=worker_id, pool=db_pool),
                 PrometheusProcessor(worker_id=worker_id),
                 MetricsPersistenceProcessor(worker_id=worker_id, pool=db_pool),
             ],

@@ -32,6 +32,7 @@ class MonitoringWorker:
         processor: ResultProcessor,
         num_workers: int,
         queue_size: int,
+        queue_size_monitoring_interval: int = 20,
     ) -> None:
         """
         Initializes a new MonitoringWorker instance.
@@ -53,6 +54,7 @@ class MonitoringWorker:
         self._queue_size = queue_size
         # The queue provides backpressure. The producer will pause if the queue is full.
         self._queue: Queue[Target] = Queue(maxsize=queue_size)
+        self._queue_size_monitoring_interval: int = queue_size_monitoring_interval
         self._worker_tasks: List[Task] = []
         self._monitor_task: Task = asyncio.create_task(self._monitor_queue())
 
@@ -97,7 +99,7 @@ class MonitoringWorker:
         A task that monitors the queue size and logs it periodically.
 
         This method runs in the background and logs the current queue size
-        every 20 seconds to help with monitoring system performance.
+        every x seconds to help with monitoring system performance.
 
         Returns:
             None
@@ -106,8 +108,8 @@ class MonitoringWorker:
 
         while True:
             try:
-                # Wait 20 seconds before logging again
-                await asyncio.sleep(20)
+                # Wait x seconds before logging again
+                await asyncio.sleep(self._queue_size_monitoring_interval)
                 qsize = self._queue.qsize()
                 # Check if the queue has a defined maximum size
                 if self._queue.maxsize > 0:
@@ -197,4 +199,8 @@ class MonitoringWorker:
 
         # 5. Wait for all worker tasks to acknowledge their cancellation and exit.
         await asyncio.gather(*all_background_tasks, return_exceptions=True)
+
+        self._logger.info("Flushing results processor...")
+        await self._processor.flush()
+
         self._logger.info("Worker shutdown complete")

@@ -20,7 +20,7 @@ from website_monitor.domain import FetchResult, Target
 logger = logging.getLogger(__name__)
 
 
-def _has_match(pattern: str, text: str) -> bool:
+def has_match(pattern: str, text: str) -> bool:
     """
     Checks if a text matches a regular expression pattern.
 
@@ -100,7 +100,7 @@ class AiohttpFetcher(TargetFetcher):
                 # Only check the regex pattern if response is successful
                 if target.regex_pattern and status_code == 200:
                     response_body: str = await response.text()
-                    regex_has_matches = _has_match(target.regex_pattern, response_body)
+                    regex_has_matches = has_match(target.regex_pattern, response_body)
 
         except Exception as e:
             error = e

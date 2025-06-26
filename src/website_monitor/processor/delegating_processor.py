@@ -22,7 +22,7 @@ class DelegatingResultProcessor(ResultProcessor):
     A concrete implementation of ResultProcessor that follows the Composite pattern.
 
     This class holds a list of other ResultProcessor instances and delegates the 'process'
-    call to each of them concurrently. This simplifies the worker logic by
+    and 'flush' calls to each of them concurrently. This simplifies the worker logic by
     exposing a single entry point for a complex processing pipeline.
 
     The implementation is fault-tolerant: if one processor fails, the others
@@ -43,7 +43,7 @@ class DelegatingResultProcessor(ResultProcessor):
 
     async def _process_with_one(self, processor: ResultProcessor, result: FetchResult) -> None:
         """
-        A helper method to safely run a single processor.
+        A helper method to safely run a single processor's 'process' method.
 
         It wraps the individual process call in a try-except block, ensuring
         that one processor's failure does not affect any others. All exceptions
@@ -52,15 +52,29 @@ class DelegatingResultProcessor(ResultProcessor):
         Args:
             processor: The individual processor to run.
             result: The fetch result to be processed.
-
-        Returns:
-            None
         """
         try:
             await processor.process(result)
-        except Exception as e:
+        except Exception:
             logger.exception(
-                f"Processor '{type(processor).__name__}' failed for target {result.target.url} with error: {e}",
+                f"Processor '{type(processor).__name__}' failed during process() for target {result.target.url}",
+            )
+
+    async def _flush_one(self, processor: ResultProcessor) -> None:
+        """
+        A helper method to safely run a single processor's 'flush' method.
+
+        It wraps the individual flush call in a try-except block, ensuring
+        that one processor's failure does not affect any others.
+
+        Args:
+            processor: The individual processor to flush.
+        """
+        try:
+            await processor.flush()
+        except Exception:
+            logger.exception(
+                f"Processor '{type(processor).__name__}' failed during flush()",
             )
 
     async def process(self, result: FetchResult) -> None:
@@ -73,9 +87,6 @@ class DelegatingResultProcessor(ResultProcessor):
 
         Args:
             result: The fetch result to be processed by all child processors.
-
-        Returns:
-            None
         """
         if not self._processors:
             return
@@ -85,3 +96,19 @@ class DelegatingResultProcessor(ResultProcessor):
 
         # Wait for all processors to complete
         await asyncio.gather(*tasks)
+
+    async def flush(self) -> None:
+        """
+        Flushes all child processors concurrently.
+
+        This method creates a task to flush each child processor and executes them
+        concurrently using asyncio.gather. This is intended to be called during
+        a graceful shutdown to ensure all buffered data is persisted.
+        """
+        if not self._processors:
+            return
+
+        logger.info(f"Flushing all {len(self._processors)} result processors...")
+        tasks = [self._flush_one(p) for p in self._processors]
+        await asyncio.gather(*tasks)
+        logger.info("All result processors flushed.")

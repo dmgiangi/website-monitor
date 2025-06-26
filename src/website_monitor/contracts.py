@@ -118,7 +118,7 @@ class ResultProcessor(abc.ABC):
     @abc.abstractmethod
     async def process(self, result: FetchResult) -> None:
         """
-        Processes a single FetchResult object.
+        Processes or buffers a single FetchResult object.
 
         This method is called for each result produced by a TargetFetcher.
         Implementations might store the result in a database, update metrics,
@@ -127,6 +127,20 @@ class ResultProcessor(abc.ABC):
         Args:
             result: The result of a target fetch operation to be processed,
                 containing all information about the check outcome.
+
+        Returns:
+            None
+        """
+        pass
+
+    @abc.abstractmethod
+    async def flush(self) -> None:
+        """
+        Forces the persistence of any buffered results.
+
+        This method is intended to be called periodically or during a graceful
+        shutdown to ensure that all processed data is saved. For processors
+        that do not buffer data, this method can be a no-op.
 
         Returns:
             None
